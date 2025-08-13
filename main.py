@@ -28,13 +28,11 @@ CHAT_ID_RAW = os.getenv("CHAT_ID", "").strip()
 if not BOT_TOKEN or not SUPABASE_URL or not SUPABASE_KEY or not CHAT_ID_RAW:
     raise EnvironmentError("Missing env: BOT_TOKEN/SUPABASE_URL/SUPABASE_KEY/CHAT_ID")
 
-# CHAT_ID numeric or channel username
 try:
     CHAT_ID: Any = int(CHAT_ID_RAW)
 except Exception:
     CHAT_ID = CHAT_ID_RAW
 
-# Config
 BINANCE_BASE = "https://api.binance.com"
 BINANCE_BATCH_SIZE = int(os.getenv("BINANCE_BATCH_SIZE", "15"))
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "8"))
@@ -44,11 +42,9 @@ ALERT_COOLDOWN_MIN = int(os.getenv("ALERT_COOLDOWN_MIN", "30"))
 USER_TZ = ZoneInfo(os.getenv("USER_TZ", "Asia/Dhaka"))  # UTC+6
 AUTO_ADD_NEW_COINS = os.getenv("AUTO_ADD_NEW_COINS", "true").lower() in ("1","true","yes")
 
-# Global sessions
 aiohttp_session: Optional[aiohttp.ClientSession] = None
 binance_sem: Optional[asyncio.Semaphore] = None
 
-# Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 logger = logging.getLogger("crypto-scanner")
 
@@ -142,7 +138,6 @@ async def get_removed_map() -> Dict[str, str]:
         logger.exception("Supabase get_removed_map error")
         return {}
 
-# Log signal (opinion optional)
 async def log_to_supabase(symbol: str, reasons_text: str, opinion_text: Optional[str]) -> None:
     coin = symbol.upper()
     ts_iso = datetime.now(timezone.utc).isoformat()
@@ -157,7 +152,6 @@ async def log_to_supabase(symbol: str, reasons_text: str, opinion_text: Optional
     except Exception:
         logger.exception("Supabase log error for %s", coin)
 
-# Query recent signals for aggregator
 async def fetch_signals_since(since_iso: str) -> List[Dict[str, Any]]:
     try:
         def query():
@@ -198,7 +192,6 @@ async def get_klines(symbol: str, interval: str, limit: int = 150):
     return data
 
 async def get_ticker_24h(symbol: str) -> Optional[float]:
-    """Return 24h price change percent as float, e.g., 3.45 for +3.45%."""
     try:
         data, _ = await binance_request("/api/v3/ticker/24hr", {"symbol": symbol})
         pct = float(data.get("priceChangePercent", 0.0))
@@ -206,6 +199,37 @@ async def get_ticker_24h(symbol: str) -> Optional[float]:
     except Exception:
         logger.exception("24h ticker error for %s", symbol)
         return None
+
+async def get_top_gainers(n=10) -> List[Tuple[str, float]]:
+    exinfo = await get_exchange_info()
+    symbols = [
+        s["symbol"] for s in exinfo.get("symbols", [])
+        if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING"
+        and s.get("isSpotTradingAllowed", True)
+        and not any(x in s["symbol"] for x in ["UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT"])
+    ]
+    global binance_sem
+    # ---------- FIX: Ensure binance_sem is always initialized before use ----------
+    if binance_sem is None:
+        binance_sem = asyncio.Semaphore(MAX_CONCURRENCY)
+
+    async def get_pct(symbol):
+        try:
+            # FIX: Ensure binance_sem is not None before using in async with
+            if binance_sem is None:
+                raise RuntimeError("binance_sem not initialized")
+            async with binance_sem:
+                pct = await get_ticker_24h(symbol)
+                await asyncio.sleep(0.3)  # rate limit
+            return (symbol, pct)
+        except Exception:
+            return (symbol, None)
+
+    tasks = [get_pct(sym) for sym in symbols]
+    all_results = await asyncio.gather(*tasks)
+    filtered = [(sym, pct) for sym, pct in all_results if pct is not None]
+    filtered.sort(key=lambda x: x[1], reverse=True)
+    return filtered[:n]
 
 # ===================== Numeric helpers =====================
 def np_safe(arr: List[float]) -> np.ndarray:
@@ -268,7 +292,6 @@ def cvd_proxy(closes: List[float], volumes: List[float]) -> np.ndarray:
 def percentile(x: np.ndarray, p: float) -> float:
     return float(np.percentile(x, p)) if x.size else 0.0
 
-# ===================== ICT/SMC blocks =====================
 def sell_side_liquidity_sweep_bullish(highs, lows, opens, closes, lookback=20):
     lows_np = np_safe(lows)
     opens_np = np_safe(opens)
@@ -342,7 +365,6 @@ def volatility_metric(closes: List[float], win=30):
     mu = float(np.mean(seg))
     return float(np.std(seg) / mu) if mu else 0.0
 
-# ===================== FVG utilities =====================
 def find_bullish_fvg_indices(highs: List[float], lows: List[float]) -> List[int]:
     out = []
     for n in range(2, len(highs)):
@@ -399,7 +421,6 @@ def bullish_fvg_alert_logic(opens, highs, lows, closes, volumes, tf_label: str):
     return None
 
 # ===================== Data fetch & parse =====================
-# >>> IMPORTANT: 5m AVOIDED as per requirement <<<
 INTERVALS_CORE = ["15m", "1h", "4h"]
 INTERVALS_FVG  = ["1h", "4h", "1d"]
 
@@ -460,9 +481,6 @@ def atr_vol_gate(highs_15, lows_15, closes_15):
 
 # ===================== Historical analysis =====================
 def simulate_signal_success(closes: List[float], highs: List[float], lows: List[float], atr: np.ndarray, idx: int, horizon: int = 6, atr_tp_mult: float = 0.8) -> bool:
-    """
-    After a signal at idx, check within `horizon` bars price moved up by ATR*atr_tp_mult from close[idx].
-    """
     if idx >= len(closes) - 1:
         return False
     entry = closes[idx]
@@ -471,30 +489,18 @@ def simulate_signal_success(closes: List[float], highs: List[float], lows: List[
     return bool(np.max(np_safe(highs[idx+1:end+1])) >= tp)
 
 def historical_strength(tf_name: str, opens, highs, lows, closes, volumes, lookback_bars: int = 220) -> Tuple[float, int]:
-    """
-    Compute a simple hit-rate for the last ~lookback_bars bars on each TF using proxy triggers.
-    """
-    # prepare series
     atr = atr_series(highs, lows, closes, 14)
     rsi = rsi_series(closes, 14)
     cvd = cvd_proxy(closes, volumes)
-
-    # proxy signal points (similar to detect_signals triggers but generic)
     signal_indices: List[int] = []
     for i in range(max(30, len(closes)-lookback_bars), len(closes)-1):
-        # minimal set to evaluate historically
         conds = []
-        # 1) displacement
         conds.append(displacement_bullish(highs[:i+1], lows[:i+1], opens[:i+1], closes[:i+1], atr[:i+1], 0.6, 1.2))
-        # 2) ssl sweep
         conds.append(sell_side_liquidity_sweep_bullish(highs[:i+1], lows[:i+1], opens[:i+1], closes[:i+1], 20))
-        # 3) rsi div
         conds.append(bullish_rsi_divergence(closes[:i+1], rsi[:i+1], 20))
-        # 4) cvd up
         conds.append(cvd_imbalance_up(cvd[:i+1], 5, 1.6))
         if sum(1 for x in conds if x) >= 2:
             signal_indices.append(i)
-
     wins = 0
     for idx in signal_indices[-100:]:
         if simulate_signal_success(closes, highs, lows, atr, idx, horizon=6, atr_tp_mult=0.8):
@@ -504,10 +510,6 @@ def historical_strength(tf_name: str, opens, highs, lows, closes, volumes, lookb
     return hit_rate, total
 
 def opinion_from_scores(scores: Dict[str, float]) -> Tuple[str, float]:
-    """
-    Weighted verdict from TF hit-rates
-    """
-    # Weights: 15m=0.4, 1h=0.35, 4h=0.25
     w = {"15m": 0.4, "1h": 0.35, "4h": 0.25}
     num = sum(scores.get(tf, 0.0) * w[tf] for tf in w)
     den = sum(w.values())
@@ -524,12 +526,6 @@ def opinion_from_scores(scores: Dict[str, float]) -> Tuple[str, float]:
 
 # ===================== Signal detection (MTF; no 5m) =====================
 async def detect_signals(symbol: str) -> Tuple[Dict[str, List[str]], Optional[str], Dict[str, float]]:
-    """
-    Returns:
-      - reasons_by_tf: { "15m": [...], "1h": [...], "4h": [...], "1d": [...] }
-      - final_opinion_text: "🔥 Strong (hist hit-rate: 72%). 15m: 65% | 1h: 70% | 4h: 80%"
-      - scores: {"15m":x, "1h":y, "4h":z}
-    """
     limits = {"15m": 240, "1h": 240, "4h": 240, "1d": 240}
     data_map = await fetch_intervals(symbol, limits)
 
@@ -546,7 +542,6 @@ async def detect_signals(symbol: str) -> Tuple[Dict[str, List[str]], Optional[st
     if not atr_vol_gate(h15, l15, c15):
         return {}, None, {}
 
-    # Indicators
     atr15 = atr_series(h15, l15, c15, 14)
     atr1h = atr_series(h1h, l1h, c1h, 14)
     rsi15 = rsi_series(c15, 14)
@@ -554,10 +549,8 @@ async def detect_signals(symbol: str) -> Tuple[Dict[str, List[str]], Optional[st
     cvd15 = cvd_proxy(c15, v15)
     cvd1h = cvd_proxy(c1h, v1h)
 
-    # Triggers per TF
     reasons_by_tf: Dict[str, List[str]] = {"15m": [], "1h": [], "4h": [], "1d": []}
 
-    # 15m
     if cvd_imbalance_up(cvd15, bars=5, mult=1.6):
         reasons_by_tf["15m"].append("CVD Imbalance Up")
     if whale_entry(v15, c15, factor=3.0):
@@ -571,7 +564,6 @@ async def detect_signals(symbol: str) -> Tuple[Dict[str, List[str]], Optional[st
     if volatility_metric(c15, 30) > 0.5:
         reasons_by_tf["15m"].append("High Volatility")
 
-    # 1h
     if cvd_imbalance_up(cvd1h, bars=3, mult=1.4):
         reasons_by_tf["1h"].append("CVD Imbalance Up")
     if sell_side_liquidity_sweep_bullish(h1h, l1h, o1h, c1h, 20):
@@ -581,7 +573,6 @@ async def detect_signals(symbol: str) -> Tuple[Dict[str, List[str]], Optional[st
     if bullish_rsi_divergence(c1h, rsi1h, 25):
         reasons_by_tf["1h"].append("RSI Bullish Div")
 
-    # FVG (1h/4h/1d)
     for tf, candles in [("1h", data_map.get("1h", [])), ("4h", data_map.get("4h", [])), ("1d", data_map.get("1d", []))]:
         if not candles:
             continue
@@ -590,7 +581,6 @@ async def detect_signals(symbol: str) -> Tuple[Dict[str, List[str]], Optional[st
         if alert:
             reasons_by_tf[tf].append("Bullish FVG Confirmed")
 
-    # Gate: need at least some confluence on 15m/1h or FVG on HTF
     gate = (
         (len(reasons_by_tf["15m"]) >= 2) or
         (len(reasons_by_tf["1h"]) >= 2) or
@@ -599,7 +589,6 @@ async def detect_signals(symbol: str) -> Tuple[Dict[str, List[str]], Optional[st
     if not gate or not cooldown_ok(symbol):
         return {}, None, {}
 
-    # Historical scores (15m/1h/4h)
     scores: Dict[str, float] = {}
     try:
         if len(c15) > 80:
@@ -644,14 +633,13 @@ async def send_alert(symbol: str, reasons_by_tf: Dict[str, List[str]], final_opi
     pct24 = await get_ticker_24h(symbol)
     pct_str = f"{pct24:+.2f}%" if pct24 is not None else "N/A"
 
-    # Build MTF breakdown text matching EXACT sample format
     def tf_line(tf: str) -> str:
         r = reasons_by_tf.get(tf, [])
         return f"{tf}: " + (" + ".join(r) if r else "No Signal")
 
     message = (
         "🚨 Bullish Signal Detected!\n"
-        f"Coin: {symbol}\n"
+        f"Coin: `{symbol}`\n"
         f"Status: {status_text}\n"
         f"Time: {timestamp}\n"
         f"24h Change: {pct_str}\n"
@@ -702,7 +690,6 @@ async def scan_one_with_backoff(coin):
             break
 
 async def auto_add_new_listings(symbols: List[str]):
-    """Auto-add newly appearing USDT spot trading symbols into watchlist (if enabled)."""
     if not AUTO_ADD_NEW_COINS:
         return
     watchlist = await get_column("watchlist")
@@ -725,14 +712,13 @@ async def batch_scan_all_with_rate_limit():
         and s.get("isSpotTradingAllowed", True)
     ]
     symbols = [c for c in symbols if not any(x in c for x in ["UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT"])]
-
-    # Auto-add newly detected coins to watchlist
     await auto_add_new_listings(symbols)
-
     logger.info("Total %s USDT spot symbols. Scanning in batches of %s ...", len(symbols), BINANCE_BATCH_SIZE)
     for batch in chunked(symbols, BINANCE_BATCH_SIZE):
         logger.info("Scanning batch of %s coins...", len(batch))
         async def limited_scan(coin):
+            if binance_sem is None:
+                raise RuntimeError("Semaphore not initialized")
             async with binance_sem:
                 await scan_one_with_backoff(coin)
         tasks = [limited_scan(coin) for coin in batch]
@@ -749,38 +735,47 @@ async def scanner_loop():
             logger.info("Sleeping 10 minutes...")
             await asyncio.sleep(600)
 
-# ===================== Aggregator (every :00 and :30 local) =====================
-LAST_REPORT_SENT: Optional[datetime] = None
+# ===================== Aggregator (custom times) =====================
+LAST_REPORT_SENT: Dict[str, datetime] = {}
+
+AGG_TIMES_LOCAL = [
+    (6, 0),
+    (10, 0),
+    (14, 0),
+    (18, 0),
+    (22, 0),
+]
+
+def _is_agg_time(dt: datetime) -> Optional[str]:
+    for hh, mm in AGG_TIMES_LOCAL:
+        if dt.hour == hh and dt.minute == mm:
+            return dt.strftime("%Y-%m-%d %H:%M")
+    return None
 
 async def aggregator_loop():
     global LAST_REPORT_SENT
     while True:
         try:
             now_local = datetime.now(USER_TZ)
-            minute = now_local.minute
-            if minute in (0, 30):
-                window_end_local = now_local.replace(second=0, microsecond=0)
-                window_end_local = window_end_local.replace(minute=(30 if window_end_local.minute >= 30 else 0))
-                if LAST_REPORT_SENT and LAST_REPORT_SENT == window_end_local:
+            agg_time_key = _is_agg_time(now_local)
+            if agg_time_key:
+                if agg_time_key in LAST_REPORT_SENT and (datetime.now(USER_TZ) - LAST_REPORT_SENT[agg_time_key]).total_seconds() < 3600:
                     await asyncio.sleep(20)
                     continue
-                since_utc = (window_end_local.astimezone(timezone.utc) - timedelta(minutes=30))
+                window_end_local = now_local.replace(second=0, microsecond=0)
+                since_utc = (window_end_local.astimezone(timezone.utc) - timedelta(hours=4))
                 since_iso = since_utc.isoformat()
                 rows = await fetch_signals_since(since_iso)
                 if rows:
                     watchlist = await get_column("watchlist")
                     haram = await get_column("haram")
                     removed_map = await get_removed_map()
-
-                    # group by coin
                     grouped: Dict[str, List[Dict[str, Any]]] = {}
                     for r in rows:
                         coin = r.get("coin", "").upper()
                         grouped.setdefault(coin, []).append(r)
-
-                    lines = [f"📋 Aggregated Signals ({window_end_local.strftime('%Y-%m-%d %H:%M %Z')})", ""]
+                    lines = [f"📋 Aggregated Signals (`{window_end_local.strftime('%Y-%m-%d %H:%M %Z')}`)", ""]
                     for coin, items in grouped.items():
-                        # status
                         if coin in haram:
                             st = "HARAM ⚠️"
                         elif coin in removed_map:
@@ -789,34 +784,27 @@ async def aggregator_loop():
                             st = "WATCHLIST ✅"
                         else:
                             st = "NEW 🚀"
-
-                        # reasons merge
                         reasons_set = []
                         for it in items:
                             rtxt = it.get("reasons", "")
                             if rtxt and rtxt not in reasons_set:
                                 reasons_set.append(rtxt)
-                        # pick latest opinion if exists
                         opinions = [it.get("opinion") for it in items if it.get("opinion")]
                         opinion_text = opinions[-1] if opinions else None
-
-                        # 24h change
                         pct24 = await get_ticker_24h(coin)
                         pct_str = f"{pct24:+.2f}%" if pct24 is not None else "N/A"
-
-                        lines.append(f"- {coin}: {st}")
-                        lines.append(f"   Reasons: " + (" | ".join(reasons_set) if reasons_set else "No Signal"))
+                        lines.append(f"- `{coin}`: {st}")
+                        lines.append("   Reasons: " + (" | ".join(reasons_set) if reasons_set else "No Signal"))
                         if opinion_text:
                             lines.append(f"   Final Opinion: {opinion_text}")
                         lines.append(f"   24h Change: {pct_str}")
-
                     message = "\n".join(lines)
                     try:
                         await bot.send_message(chat_id=CHAT_ID, text=message)
                         logger.info("Aggregator message sent for window %s", window_end_local.isoformat())
                     except Exception:
                         logger.exception("Telegram send error in aggregator")
-                LAST_REPORT_SENT = window_end_local
+                LAST_REPORT_SENT[agg_time_key] = now_local
                 await asyncio.sleep(70)
             else:
                 await asyncio.sleep(20)
@@ -824,12 +812,26 @@ async def aggregator_loop():
             logger.exception("Aggregator loop error")
             await asyncio.sleep(30)
 
+# ===================== NEW: Top Gainer Command Handler =====================
+async def top_gainer_handler(update: TGUpdate, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.text:
+        return
+    username = get_username(update)
+    if not is_admin(username):
+        await update.message.reply_text("⛔ You are not authorized to use commands.")
+        return
+    await update.message.reply_text("⏳ Fetching top gainers, please wait...")
+    try:
+        gainers = await get_top_gainers(10)
+        lines = ["🔥 Top 10 Binance USDT Spot Gainers (24h):"]
+        for i, (coin, pct) in enumerate(gainers, 1):
+            lines.append(f"{i}. `{coin}` : {pct:+.2f}%")
+        await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to fetch: {e}")
+
 # ===================== Telegram commands =====================
 def parse_command(text: str) -> Tuple[List[str], str]:
-    """
-    returns (coins, action) where coins are like 'BTCUSDT'
-    supported actions: check, remove, haram, add again, halal
-    """
     if not text:
         return [], ""
     clean = text.strip()
@@ -875,7 +877,7 @@ async def start(update: TGUpdate, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await update.message.reply_text(
         f"👋 Hello @{username}! Send coin commands like:\n"
-        "BTCUSDT Check\nETH Remove\nBNB Haram\nBTC Add\nBNB Halal"
+        "BTCUSDT Check\nETH Remove\nBNB Haram\nBTC Add\nBNB Halal\nOr send: top gainer list"
     )
 
 async def status(update: TGUpdate, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -888,16 +890,15 @@ async def status(update: TGUpdate, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"❌ Supabase error: {e}")
         return
 
-    # NEW: show totals + lists
     wl_total = len(watchlist)
     hr_total = len(haram)
 
     parts = []
     parts.append(f"📊 Watchlist ({wl_total}):")
-    parts.extend(watchlist if watchlist else ["—"])
+    parts.extend([f"`{w}`" for w in watchlist] if watchlist else ["—"])
     parts.append("")
     parts.append(f"⚠️ Haram ({hr_total}):")
-    parts.extend(haram if haram else ["—"])
+    parts.extend([f"`{h}`" for h in haram] if haram else ["—"])
 
     reply = "\n".join(parts)
     await update.message.reply_text(reply)
@@ -905,17 +906,20 @@ async def status(update: TGUpdate, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def handle_commands(update: TGUpdate, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
         return
+    text = update.message.text.strip()
+    if text.lower() == "top gainer list":
+        await top_gainer_handler(update, context)
+        return
     username = get_username(update)
     if not is_admin(username):
         await update.message.reply_text("⛔ You are not authorized to use commands.")
         return
-    text = update.message.text.strip()
     logger.info("Command from %s: %s", username, text)
     coins, action = parse_command(text)
     valid_actions = {"Check", "Remove", "Haram", "Add again", "Halal"}
     if not coins or action not in valid_actions:
         await update.message.reply_text(
-            "❌ Invalid format. Use keywords like:\nCheck, Remove, Haram, Add Again, Halal\nExample: BTC ETH Check"
+            "❌ Invalid format. Use keywords like:\nCheck, Remove, Haram, Add Again, Halal\nExample: BTC ETH Check\nOr send: top gainer list"
         )
         return
     try:
@@ -958,19 +962,18 @@ async def handle_commands(update: TGUpdate, context: ContextTypes.DEFAULT_TYPE) 
 
     reply_parts = []
     if already:
-        reply_parts.append("🟢 Already in Watchlist:\n" + "\n".join(already))
+        reply_parts.append("🟢 Already in Watchlist:\n" + "\n".join(f"`{x}`" for x in already))
     if added:
-        reply_parts.append("✅ New Added:\n" + "\n".join(added))
+        reply_parts.append("✅ New Added:\n" + "\n".join(f"`{x}`" for x in added))
     if marked_haram:
-        reply_parts.append("⚠️ Marked as Haram:\n" + "\n".join(marked_haram))
+        reply_parts.append("⚠️ Marked as Haram:\n" + "\n".join(f"`{x}`" for x in marked_haram))
     if removed:
-        reply_parts.append("🗑️ Removed:\n" + "\n".join(removed))
+        reply_parts.append("🗑️ Removed:\n" + "\n".join(f"`{x}`" for x in removed))
     if unharamed:
-        reply_parts.append("✅ Removed from Haram:\n" + "\n".join(unharamed))
+        reply_parts.append("✅ Removed from Haram:\n" + "\n".join(f"`{x}`" for x in unharamed))
     reply = "\n\n".join(reply_parts) or "✅ No changes made."
     await update.message.reply_text(reply)
 
-# ===================== Bot entrypoint =====================
 async def post_init(application):
     global aiohttp_session, binance_sem
     aiohttp_session = aiohttp.ClientSession(
@@ -979,7 +982,6 @@ async def post_init(application):
         headers={"User-Agent": "CryptoWatchlistBot/1.3 (+contact)"}
     )
     binance_sem = asyncio.Semaphore(MAX_CONCURRENCY)
-    # start scanner and aggregator
     application.create_task(scanner_loop())
     application.create_task(aggregator_loop())
     logger.info("post_init completed: aiohttp session created and background tasks started.")

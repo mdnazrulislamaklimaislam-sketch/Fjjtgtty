@@ -1,4 +1,5 @@
-# -*- coding: utf-8 -*-
+# -*- CryptoICT AI -*-
+
 import os
 import re
 import asyncio
@@ -19,12 +20,17 @@ from telegram.ext import (
 )
 from supabase import create_client, Client
 
+# NEW: For historical win rate using binance-connector (official)
+from binance.client import Client as BinanceClient
+
 # ===================== env & logging =====================
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
 CHAT_ID_RAW = os.getenv("CHAT_ID", "").strip()
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
 
 if not BOT_TOKEN or not SUPABASE_URL or not SUPABASE_KEY or not CHAT_ID_RAW:
     raise EnvironmentError("Missing env: BOT_TOKEN/SUPABASE_URL/SUPABASE_KEY/CHAT_ID")
@@ -51,6 +57,7 @@ logger = logging.getLogger("crypto-scanner")
 
 bot = TGBot(token=BOT_TOKEN)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+binance_connector_client = BinanceClient(BINANCE_API_KEY, BINANCE_API_SECRET)
 
 # ===================== flask keep alive =====================
 flask_app = Flask(__name__)
@@ -162,7 +169,7 @@ async def fetch_signals_since(since_iso: str) -> List[Dict[str, Any]]:
         logger.exception("Supabase fetch_signals_since error")
         return []
 
-# ===================== Binance requests =====================
+# ===================== Binance REST =====================
 async def binance_request(path: str, params: Optional[dict] = None) -> Tuple[Any, Optional[str]]:
     global aiohttp_session
     if aiohttp_session is None:
@@ -227,7 +234,8 @@ async def get_top_gainers(n=10, filtering_on=True) -> List[Tuple[str, float]]:
         try:
             if binance_sem is None:
                 raise RuntimeError("binance_sem not initialized")
-            async with binance_sem:
+            sem = binance_sem
+            async with sem:
                 pct = await get_ticker_24h(symbol)
                 await asyncio.sleep(0.25)
             return (symbol, pct)
@@ -240,7 +248,7 @@ async def get_top_gainers(n=10, filtering_on=True) -> List[Tuple[str, float]]:
     filtered.sort(key=lambda x: x[1], reverse=True)
     return filtered[:n]
 
-# ===================== Numeric helpers =====================
+# ===================== Numeric helpers & Indicators =====================
 def np_safe(arr: List[float]) -> np.ndarray:
     return np.array(arr, dtype=float) if arr else np.array([], dtype=float)
 
@@ -287,6 +295,15 @@ def ema_series(values: List[float], length: int) -> np.ndarray:
         out[i] = alpha * values_np[i] + (1 - alpha) * out[i - 1]
     return out
 
+def sma_series(values: List[float], length: int) -> np.ndarray:
+    v = np_safe(values)
+    if v.size < length:
+        return np.full(v.size, safe_mean(v) if v.size else 0.0)
+    kernel = np.ones(length) / length
+    out = np.convolve(v, kernel, mode='valid')
+    pad = np.full(v.size - out.size, out[0] if out.size else 0.0)
+    return np.concatenate([pad, out])
+
 def cvd_proxy(closes: List[float], volumes: List[float]) -> np.ndarray:
     closes_np = np_safe(closes)
     volumes_np = np_safe(volumes)
@@ -300,6 +317,14 @@ def cvd_proxy(closes: List[float], volumes: List[float]) -> np.ndarray:
 
 def percentile(x: np.ndarray, p: float) -> float:
     return float(np.percentile(x, p)) if x.size else 0.0
+
+def rel_volume(volumes: List[float], lookback=20) -> float:
+    v = np_safe(volumes)
+    if v.size < lookback + 1:
+        return 1.0
+    last = v[-1]
+    avg = safe_mean(v[-lookback-1:-1])
+    return float(last / avg) if avg > 0 else 1.0
 
 def sell_side_liquidity_sweep_bullish(highs, lows, opens, closes, lookback=20):
     lows_np = np_safe(lows)
@@ -329,13 +354,14 @@ def bullish_rsi_divergence(closes: List[float], rsi: np.ndarray, lookback=20) ->
     closes_np = np_safe(closes)
     if closes_np.size < lookback + 5 or rsi.size != closes_np.size:
         return False
-    window = closes_np[-(lookback+5):]
-    if window.size < 6:
+    segment = closes_np[-(lookback+5):]
+    if segment.size < 6:
         return False
-    rel_idx = np.argsort(window)[:6]
+    # find two relative lows
+    local_idx = np.argsort(segment)[:6]
     chosen = []
-    for idx in rel_idx:
-        abs_idx = idx + (closes_np.size - window.size)
+    for idx in local_idx:
+        abs_idx = idx + (closes_np.size - segment.size)
         if not chosen or abs(abs_idx - chosen[-1]) > 2:
             chosen.append(int(abs_idx))
         if len(chosen) >= 2:
@@ -374,6 +400,34 @@ def volatility_metric(closes: List[float], win=30):
     mu = float(np.mean(seg))
     return float(np.std(seg) / mu) if mu else 0.0
 
+# --- Bands & Squeeze ---
+def bbands(values: List[float], length=20, mult=2.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    v = np_safe(values)
+    ma = sma_series(values, length)
+    std = np.zeros_like(v)
+    if v.size >= length:
+        for i in range(length-1, v.size):
+            std[i] = np.std(v[i-length+1:i+1])
+    upper = ma + mult * std
+    lower = ma - mult * std
+    width = (upper - lower) / ma.clip(min=1e-9)
+    return lower, ma, upper, width
+
+def keltner_channels(highs: List[float], lows: List[float], closes: List[float], length=20, mult=1.5):
+    ema = ema_series(closes, length)
+    atr = atr_series(highs, lows, closes, 20)
+    upper = ema + mult * atr
+    lower = ema - mult * atr
+    return lower, ema, upper
+
+def is_bb_inside_kc(highs, lows, closes, length=20, bb_mult=2.0, kc_mult=1.5) -> bool:
+    bb_l, bb_m, bb_u, _ = bbands(closes, length, bb_mult)
+    kc_l, kc_m, kc_u = keltner_channels(highs, lows, closes, length, kc_mult)
+    if len(bb_l) == 0:
+        return False
+    return bool(bb_u[-1] < kc_u[-1] and bb_l[-1] > kc_l[-1])
+
+# --- FVG ---
 def find_bullish_fvg_indices(highs: List[float], lows: List[float]) -> List[int]:
     out = []
     for n in range(2, len(highs)):
@@ -488,39 +542,62 @@ def atr_vol_gate(highs_15, lows_15, closes_15):
     p40 = percentile(atr_slice, 40)
     return bool(cur_atr >= p40 and cur_atr > 0)
 
-# ===================== Historical analysis =====================
-def simulate_signal_success(closes: List[float], highs: List[float], lows: List[float], atr: np.ndarray, idx: int, horizon: int = 6, atr_tp_mult: float = 0.8) -> bool:
-    if idx >= len(closes) - 1:
-        return False
-    entry = closes[idx]
-    tp = entry + float(atr[idx]) * atr_tp_mult if atr.size > idx else entry * 1.005
-    end = min(len(closes)-1, idx + horizon)
-    return bool(np.max(np_safe(highs[idx+1:end+1])) >= tp)
+# ===================== Historical Win Rate (simple proxy) =====================
+def get_binance_klines_official(symbol: str, interval: str, start_time: int, end_time: int, max_per_req=1000) -> List[list]:
+    all_klines = []
+    cur_start = start_time
+    while cur_start < end_time:
+        klines = binance_connector_client.get_klines(
+            symbol=symbol,
+            interval=interval,
+            startTime=cur_start,
+            endTime=end_time,
+            limit=max_per_req,
+        )
+        if not klines:
+            break
+        all_klines.extend(klines)
+        last_time = klines[-1][0]
+        if last_time == cur_start:
+            break
+        cur_start = last_time + 1
+        if len(klines) < max_per_req:
+            break
+    return all_klines
 
-def historical_strength(tf_name: str, opens, highs, lows, closes, volumes, lookback_bars: int = 220) -> Tuple[float, int]:
-    atr = atr_series(highs, lows, closes, 14)
-    rsi = rsi_series(closes, 14)
-    cvd = cvd_proxy(closes, volumes)
-    signal_indices: List[int] = []
-    for i in range(max(30, len(closes)-lookback_bars), len(closes)-1):
-        conds = []
-        conds.append(displacement_bullish(highs[:i+1], lows[:i+1], opens[:i+1], closes[:i+1], atr[:i+1], 0.6, 1.2))
-        conds.append(sell_side_liquidity_sweep_bullish(highs[:i+1], lows[:i+1], opens[:i+1], closes[:i+1], 20))
-        conds.append(bullish_rsi_divergence(closes[:i+1], rsi[:i+1], 20))
-        conds.append(cvd_imbalance_up(cvd[:i+1], 5, 1.6))
-        if sum(1 for x in conds if x) >= 2:
-            signal_indices.append(i)
-    wins = 0
-    for idx in signal_indices[-100:]:
-        if simulate_signal_success(closes, highs, lows, atr, idx, horizon=6, atr_tp_mult=0.8):
+def calc_hist_win_rate(symbol: str, interval: str, pump_pct=5.0) -> Tuple[float, int]:
+    now = datetime.now(timezone.utc)
+    ms_per_bar = {'15m': 15*60*1000, '1h': 60*60*1000, '4h': 4*60*60*1000}[interval]
+    bars_per_year = int((365*24*60*60*1000) / ms_per_bar)
+    end_time = int(now.timestamp() * 1000)
+    start_time = end_time - int(1.1 * bars_per_year * ms_per_bar)
+    candles = get_binance_klines_official(symbol, interval, start_time, end_time)
+    if len(candles) < 100:
+        return 0.0, 0
+    opens, highs, lows, closes, volumes, times = parse_ohlcv(candles)
+    wins, total = 0, 0
+    lookahead = 6
+    for i in range(len(closes)-lookahead-1):
+        entry = closes[i]
+        target = entry * (1 + pump_pct/100)
+        future_high = max(highs[i+1:i+1+lookahead])
+        if future_high >= target:
             wins += 1
-    total = len(signal_indices[-100:])
-    hit_rate = (wins / total * 100.0) if total > 0 else 0.0
-    return hit_rate, total
+        total += 1
+    win_rate = (wins/total*100) if total > 0 else 0.0
+    return win_rate, total
 
-def opinion_from_scores(scores: Dict[str, float]) -> Tuple[str, float]:
+async def get_hist_win_rates(symbol: str) -> Dict[str, float]:
+    loop = asyncio.get_event_loop()
+    out = {}
+    for tf in ['15m','1h','4h']:
+        wr, _ = await loop.run_in_executor(None, lambda: calc_hist_win_rate(symbol, tf))
+        out[tf] = wr
+    return out
+
+def opinion_from_hist_win_rates(hw_rates: Dict[str, float]) -> Tuple[str, float]:
     w = {"15m": 0.4, "1h": 0.35, "4h": 0.25}
-    num = sum(scores.get(tf, 0.0) * w[tf] for tf in w)
+    num = sum(hw_rates.get(tf, 0.0) * w[tf] for tf in w)
     den = sum(w.values())
     agg = num / den if den else 0.0
     if agg >= 70:
@@ -533,91 +610,298 @@ def opinion_from_scores(scores: Dict[str, float]) -> Tuple[str, float]:
         verdict = "⚪ No edge"
     return verdict, agg
 
-# ===================== Signal detection (MTF; no 5m) =====================
-async def detect_signals(symbol: str) -> Tuple[Dict[str, List[str]], Optional[str], Dict[str, float]]:
+# ===================== Helper: structure/MSS/ChoCH =====================
+def swing_high_idx(highs: List[float], lookback=5) -> Optional[int]:
+    h = np_safe(highs)
+    if h.size < 2*lookback+1:
+        return None
+    i = h.size - 1 - lookback
+    window = h[i-lookback:i+lookback+1]
+    return i if h[i] == np.max(window) else None
+
+def swing_low_idx(lows: List[float], lookback=5) -> Optional[int]:
+    lows_np = np_safe(lows)
+    if lows_np.size < 2*lookback+1:
+        return None
+    i = lows_np.size - 1 - lookback
+    window = lows_np[i-lookback:i+lookback+1]
+    return i if lows_np[i] == np.min(window) else None
+
+def broke_above_previous_swing_high(closes: List[float], highs: List[float], lookback=5) -> bool:
+    # close > previous swing high
+    h = np_safe(highs)
+    c = np_safe(closes)
+    if h.size < lookback*2+2 or c.size < lookback*2+2:
+        return False
+    # find previous swing high index (not the most recent bar)
+    for offset in range(lookback+1, min(lookback*6, h.size-1)):
+        i = h.size - 1 - offset
+        if i < lookback or i+lookback >= h.size:
+            continue
+        if h[i] == np.max(h[i-lookback:i+lookback+1]):
+            return bool(c[-1] > h[i])
+    return False
+
+# ===================== 5 Profiles =====================
+def profile_htf_sweep_mss_fvg(o1h,h1h,l1h,c1h,v1h,
+                              o4h,h4h,l4h,c4h,v4h,
+                              o15,h15,l15,c15,v15) -> Tuple[bool,List[str]]:
+    reasons = []
+    # HTF sweep on 1H or 4H
+    sweep_1h = sell_side_liquidity_sweep_bullish(h1h,l1h,o1h,c1h,lookback=20)
+    sweep_4h = sell_side_liquidity_sweep_bullish(h4h,l4h,o4h,c4h,lookback=20) if len(c4h)>0 else False
+    if sweep_1h or sweep_4h:
+        reasons.append("HTF Sell-side Sweep")
+    # MSS/ChoCH on 15m/1h
+    atr15 = atr_series(h15,l15,c15,14)
+    disp_15 = displacement_bullish(h15,l15,o15,c15,atr15,0.55,1.15)
+    choch_1h = broke_above_previous_swing_high(c1h,h1h,lookback=5)
+    if disp_15 or choch_1h:
+        reasons.append("MSS/ChoCH + Displacement")
+    # FVG reclaim on 15m or 1h
+    fvg_15 = bullish_fvg_alert_logic(o15,h15,l15,c15,v15,"15M")
+    fvg_1h = bullish_fvg_alert_logic(o1h,h1h,l1h,c1h,v1h,"1H")
+    if fvg_15 or fvg_1h:
+        reasons.append("FVG Reclaim")
+    # CVD + RelVol (5m/15m proxy -> 15m used)
+    cvd15 = cvd_proxy(c15,v15)
+    cvd_ok = cvd_imbalance_up(cvd15,bars=5,mult=1.5)
+    relv_ok = rel_volume(v15,20) >= 1.5
+    if cvd_ok and relv_ok:
+        reasons.append("CVD Ramp + RelVol↑")
+    ok = (len(reasons) >= 3)  # need confluence
+    return ok, reasons
+
+def profile_bullish_fvg_htf(o1h,h1h,l1h,c1h,v1h, o4h,h4h,l4h,c4h,v4h, o1d,h1d,l1d,c1d,v1d) -> Tuple[bool,List[str]]:
+    reasons=[]
+    # 1D/4H Bullish FVG "inside-close then above-close"
+    for tf_name, (o,h,lows,c,v) in [("1D",(o1d,h1d,l1d,c1d,v1d)), ("4H",(o4h,h4h,l4h,c4h,v4h))]:
+        if len(c)==0:
+            continue
+        alert = bullish_fvg_alert_logic(o,h,lows,c,v,tf_name)
+        if alert:
+            reasons.append(f"{alert}")
+    # extra volume/CVD confirmation already inside logic; add HTF bias check in caller
+    ok = len(reasons) >= 1
+    return ok, reasons
+
+def profile_squeeze_expansion(o1h,h1h,l1h,c1h,v1h) -> Tuple[bool,List[str]]:
+    reasons=[]
+    # BB Squeeze + KC (classic squeeze)
+    squeeze = is_bb_inside_kc(h1h,l1h,c1h,length=20, bb_mult=2.0, kc_mult=1.5)
+    _,_,_, bb_width = bbands(c1h,20,2.0)
+    width_p20_ok = False
+    if len(bb_width)>30:
+        p20 = percentile(bb_width[-30:], 20)
+        width_p20_ok = bb_width[-1] <= p20
+    if squeeze and width_p20_ok:
+        # breakout candle above upper BB + rel vol
+        bb_l, bb_m, bb_u, _ = bbands(c1h,20,2.0)
+        relv = rel_volume(v1h,20)
+        if len(c1h)>0 and len(bb_u)>0 and (c1h[-1] > bb_u[-1]) and relv >= 1.5:
+            cvd1h = cvd_proxy(c1h,v1h)
+            if cvd_imbalance_up(cvd1h,bars=3,mult=1.2):
+                reasons.append("Squeeze→Expansion (1H)")
+    ok = len(reasons) >= 1
+    return ok, reasons
+
+def profile_rs_breakout_vs_btc(c1h_coin: List[float], c1h_btc: List[float],
+                               h1h: List[float], c15: List[float], h15: List[float]) -> Tuple[bool,List[str]]:
+    reasons=[]
+    c_coin = np_safe(c1h_coin)
+    c_btc = np_safe(c1h_btc)
+    if c_coin.size<25 or c_btc.size<25:
+        return False, reasons
+    rs = c_coin / np.clip(c_btc,1e-9,None)
+    rs_hh = bool(rs[-1] >= np.max(rs[-20:]))
+    if rs_hh:
+        # structure breakout on 1h or 15m displacement
+        bos_1h = broke_above_previous_swing_high(c1h_coin,h1h,5)
+        disp_15 = displacement_bullish(h15,h15,h15,c15,atr_series(h15,h15,c15,14),0.5,1.1) if len(h15)==len(c15) and len(h15)>0 else False
+        if bos_1h or disp_15:
+            reasons.append("RS Breakout vs BTC (1H)")
+    ok = len(reasons) >= 1
+    return ok, reasons
+
+def profile_weekly_orb(o1h,h1h,l1h,c1h,v1h, now_utc: datetime) -> Tuple[bool,List[str]]:
+    reasons=[]
+    # Weekly OR: Monday 00:00–08:00 UTC first 8 bars (1h)
+    # Build week start
+    if not c1h:
+        return False, reasons
+    # reconstruct times from synthetic index length; we don't have timestamps here,
+    # so approximate using last N bars aligned to now_utc (best-effort).
+    # Safer path: this profile will use only structural logic + relVol/CVD on recent range.
+    # Define OR window as last 8 bars if now is Monday morning; otherwise use rolling Mon session:
+    # We'll compute dynamic OR using last week's Monday 8 bars if available
+    # For simplicity & robustness: take the last 8 bars of the current week (from Monday 00:00 UTC)
+    # needing timestamps → adjust parser to return times (we have a helper at call site).
+    return False, reasons  # fallback (we'll implement ORB in detector using real timestamps)
+
+# ===================== Detector (MTF; no 5m) =====================
+async def detect_signals(symbol: str, btc_1h_cache: Optional[Dict[str,List[float]]] = None) -> Tuple[Dict[str, List[str]], Optional[str], Dict[str, float], List[str]]:
     limits = {"15m": 240, "1h": 240, "4h": 240, "1d": 240}
     data_map = await fetch_intervals(symbol, limits)
-
     if any(len(data_map.get(iv, [])) == 0 for iv in ["15m", "1h"]):
-        return {}, None, {}
+        return {}, None, {}, []
 
-    o15, h15, l15, c15, v15, _ = parse_ohlcv(data_map["15m"])
-    o1h, h1h, l1h, c1h, v1h, _ = parse_ohlcv(data_map["1h"])
-    o4h, h4h, l4h, c4h, v4h, _ = parse_ohlcv(data_map.get("4h", []))
-    o1d, h1d, l1d, c1d, v1d, _ = parse_ohlcv(data_map.get("1d", []))
+    # OHLCV
+    o15,h15,l15,c15,v15,t15 = parse_ohlcv(data_map["15m"])
+    o1h,h1h,l1h,c1h,v1h,t1h = parse_ohlcv(data_map["1h"])
+    o4h,h4h,l4h,c4h,v4h,t4h = parse_ohlcv(data_map.get("4h", []))
+    o1d,h1d,l1d,c1d,v1d,t1d = parse_ohlcv(data_map.get("1d", []))
 
+    # Global gates
+    if not c1h or not c15:
+        return {}, None, {}, []
+    if not atr_vol_gate(h15,l15,c15):
+        return {}, None, {}, []
     if not htf_bullish_bias(c1h, c4h):
-        return {}, None, {}
-    if not atr_vol_gate(h15, l15, c15):
-        return {}, None, {}
+        return {}, None, {}, []
 
-    atr15 = atr_series(h15, l15, c15, 14)
-    atr1h = atr_series(h1h, l1h, c1h, 14)
-    rsi15 = rsi_series(c15, 14)
-    rsi1h = rsi_series(c1h, 14)
-    cvd15 = cvd_proxy(c15, v15)
-    cvd1h = cvd_proxy(c1h, v1h)
+    # Historical WR (edge gate)
+    hw_rates = await get_hist_win_rates(symbol)
+    verdict, agg = opinion_from_hist_win_rates(hw_rates)
+    # stricter floor for short-TF
+    if agg < 40.0:
+        return {}, None, hw_rates, []
 
+    # Short-TF 2-of-N rule (vol spike, CVD↑, whale, sweep, displacement, RSI-div) on 15m
+    short_reasons = 0
+    relv15 = rel_volume(v15,20) >= 1.5
+    if relv15:
+        short_reasons += 1
+    if cvd_imbalance_up(cvd_proxy(c15,v15), bars=5, mult=1.4):
+        short_reasons += 1
+    if whale_entry(v15,c15, factor=3.0):
+        short_reasons += 1
+    if sell_side_liquidity_sweep_bullish(h15,l15,o15,c15,20):
+        short_reasons += 1
+    if displacement_bullish(h15,l15,o15,c15, atr_series(h15,l15,c15,14), 0.55, 1.15):
+        short_reasons += 1
+    if bullish_rsi_divergence(c15, rsi_series(c15,14), 25):
+        short_reasons += 1
+    if short_reasons < 2:
+        return {}, None, hw_rates, []
+
+    # Profiles
+    profiles_triggered: List[str] = []
     reasons_by_tf: Dict[str, List[str]] = {"15m": [], "1h": [], "4h": [], "1d": []}
 
-    if cvd_imbalance_up(cvd15, bars=5, mult=1.6):
+    # 1) HTF Sweep → MSS/ChoCH → FVG Reclaim + CVD
+    ok1, r1 = profile_htf_sweep_mss_fvg(o1h,h1h,l1h,c1h,v1h, o4h,h4h,l4h,c4h,v4h, o15,h15,l15,c15,v15)
+    if ok1:
+        profiles_triggered.append("HTF Sweep→MSS→FVG+CVD")
+        reasons_by_tf["1h"].extend(r1)
+
+    # 2) Daily/4H Bullish FVG reclaim
+    ok2, r2 = profile_bullish_fvg_htf(o1h,h1h,l1h,c1h,v1h, o4h,h4h,l4h,c4h,v4h, o1d,h1d,l1d,c1d,v1d)
+    if ok2:
+        profiles_triggered.append("HTF Bullish FVG Reclaim")
+        # attribute to respective TFs
+        for item in r2:
+            if "1D" in item:
+                reasons_by_tf["1d"].append(item)
+            elif "4H" in item:
+                reasons_by_tf["4h"].append(item)
+            else:
+                reasons_by_tf["1h"].append(item)
+
+    # 3) Squeeze → Expansion (1H)
+    ok3, r3 = profile_squeeze_expansion(o1h,h1h,l1h,c1h,v1h)
+    if ok3:
+        profiles_triggered.append("Squeeze→Expansion (1H)")
+        reasons_by_tf["1h"].extend(r3)
+
+    # 4) RS Breakout vs BTC + Structure
+    # Fetch BTC 1h closes from cache or network (to save rate-limit)
+    c1h_btc: List[float] = []
+    if btc_1h_cache and "BTCUSDT" in btc_1h_cache:
+        c1h_btc = btc_1h_cache["BTCUSDT"]
+    else:
+        btc_1h = await get_klines("BTCUSDT","1h",240)
+        _,_,_,c_btc,_,_ = parse_ohlcv(btc_1h)
+        c1h_btc = c_btc
+        if btc_1h_cache is not None:
+            btc_1h_cache["BTCUSDT"] = c1h_btc
+    ok4, r4 = profile_rs_breakout_vs_btc(c1h, c1h_btc, h1h, c15, h15)
+    if ok4:
+        profiles_triggered.append("RS Breakout vs BTC")
+        reasons_by_tf["1h"].extend(r4)
+
+    # 5) Weekly ORB — (implemented lightly via FVG/structure & HTF bias already).
+    # Optional: You can add a timestamp-based ORB using t1h (list of ms). Keeping conservative:
+    # We'll skip if timestamps are not robustly available across all symbols.
+    # profiles_triggered.append("Weekly ORB (opt)")  # disabled to avoid false positives
+
+    # Add base reasons (from previous system) to enrich TF lines:
+    if cvd_imbalance_up(cvd_proxy(c15, v15), bars=5, mult=1.6):
         reasons_by_tf["15m"].append("CVD Imbalance Up")
     if whale_entry(v15, c15, factor=3.0):
         reasons_by_tf["15m"].append("Whale Entry")
     if sell_side_liquidity_sweep_bullish(h15, l15, o15, c15, 20):
         reasons_by_tf["15m"].append("SSL Sweep")
-    if displacement_bullish(h15, l15, o15, c15, atr15, 0.6, 1.2):
+    if displacement_bullish(h15, l15, o15, c15, atr_series(h15,l15,c15,14), 0.6, 1.2):
         reasons_by_tf["15m"].append("Smart Money Entry (Displacement)")
-    if bullish_rsi_divergence(c15, rsi15, 20):
+    if bullish_rsi_divergence(c15, rsi_series(c15,14), 20):
         reasons_by_tf["15m"].append("RSI Bullish Div")
     if volatility_metric(c15, 30) > 0.5:
         reasons_by_tf["15m"].append("High Volatility")
 
-    if cvd_imbalance_up(cvd1h, bars=3, mult=1.4):
-        reasons_by_tf["1h"].append("CVD Imbalance Up")
-    if sell_side_liquidity_sweep_bullish(h1h, l1h, o1h, c1h, 20):
-        reasons_by_tf["1h"].append("SSL Sweep")
-    if displacement_bullish(h1h, l1h, o1h, c1h, atr1h, 0.55, 1.15):
-        reasons_by_tf["1h"].append("Smart Money Entry")
-    if bullish_rsi_divergence(c1h, rsi1h, 25):
-        reasons_by_tf["1h"].append("RSI Bullish Div")
-
+    # HTF FVG confirm (existing)
     for tf, candles in [("1h", data_map.get("1h", [])), ("4h", data_map.get("4h", [])), ("1d", data_map.get("1d", []))]:
         if not candles:
             continue
-        o, h, lows, c, v, _ = parse_ohlcv(candles)
-        alert = bullish_fvg_alert_logic(o, h, lows, c, v, tf.upper())
+        o,h,lows,c,v,_ = parse_ohlcv(candles)
+        alert = bullish_fvg_alert_logic(o,h,lows,c,v,tf.upper())
         if alert:
             reasons_by_tf[tf].append("Bullish FVG Confirmed")
 
+    # Low-prob short-TF filter:
     gate = (
-        (len(reasons_by_tf["15m"]) >= 2) or
+        (len(reasons_by_tf["15m"]) >= 3) or
         (len(reasons_by_tf["1h"]) >= 2) or
         any("Bullish FVG Confirmed" in x for x in reasons_by_tf["1h"] + reasons_by_tf["4h"] + reasons_by_tf["1d"])
     )
     if not gate or not cooldown_ok(symbol):
-        return {}, None, {}
+        return {}, None, {}, []
 
-    scores: Dict[str, float] = {}
-    try:
-        if len(c15) > 80:
-            s15, _ = historical_strength("15m", o15, h15, l15, c15, v15)
-            scores["15m"] = s15
-        if len(c1h) > 80:
-            s1h, _ = historical_strength("1h", o1h, h1h, l1h, c1h, v1h)
-            scores["1h"] = s1h
-        if len(c4h) > 80:
-            s4h, _ = historical_strength("4h", o4h, h4h, l4h, c4h, v4h)
-            scores["4h"] = s4h
-    except Exception:
-        logger.exception("Historical analysis error")
-        scores = {tf: 0.0 for tf in ["15m", "1h", "4h"]}
+    # Compose opinion text
+    final_text = f"{verdict} (Hist-Win Rate: {round(agg):.0f}%). " \
+                 f"15m: {round(hw_rates.get('15m',0)):.0f}% | 1h: {round(hw_rates.get('1h',0)):.0f}% | 4h: {round(hw_rates.get('4h',0)):.0f}%"
+    return reasons_by_tf, final_text, hw_rates, profiles_triggered
 
-    verdict, agg = opinion_from_scores(scores)
-    final_text = f"{verdict} (hist hit-rate: {round(agg):.0f}%). " \
-                 f"15m: {round(scores.get('15m',0)):.0f}% | 1h: {round(scores.get('1h',0)):.0f}% | 4h: {round(scores.get('4h',0)):.0f}%"
+# ===================== Volatility Coin List =====================
+async def volatility_coin_list(top_n: int = 20) -> List[Tuple[str, float]]:
+    exinfo = await get_exchange_info()
+    symbols = [
+        s["symbol"] for s in exinfo.get("symbols", [])
+        if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING"
+        and s.get("isSpotTradingAllowed", True)
+        and not any(x in s["symbol"] for x in ["UPUSDT","DOWNUSDT","BULLUSDT","BEARUSDT"])
+    ]
+    global binance_sem
+    if binance_sem is None:
+        binance_sem = asyncio.Semaphore(MAX_CONCURRENCY)
 
-    return reasons_by_tf, final_text, scores
+    async def vol_for(sym: str) -> Tuple[str,float]:
+        try:
+            if binance_sem is None:
+                raise RuntimeError("Semaphore not initialized")
+            sem = binance_sem
+            async with sem:
+                k = await get_klines(sym, "1h", 180)
+                _,_,_,c,_,_ = parse_ohlcv(k)
+                v = volatility_metric(c, win=60)  # 60 bars (~2.5 days 1H)
+                await asyncio.sleep(0.07)
+                return sym, v
+        except Exception:
+            return sym, 0.0
+
+    tasks = [vol_for(s) for s in symbols]
+    res = await asyncio.gather(*tasks)
+    res.sort(key=lambda x: x[1], reverse=True)
+    return res[:max(1, top_n)]
 
 # ===================== Alerts & send =====================
 async def format_status(symbol: str) -> str:
@@ -628,15 +912,15 @@ async def format_status(symbol: str) -> str:
     if s in haram:
         return "HARAM ⚠️"
     if s in removed_map:
-        return f"REMOVED@{removed_map[s]}"
+        return f"REMOVED {removed_map[s]}"
     if s in watchlist:
         return "WATCHLIST ✅"
     return "NEW 🚀"
 
 def now_local_str() -> str:
-    return datetime.now(USER_TZ).strftime("%Y-%m-%d %H:%M %Z")
+    return datetime.now(USER_TZ).strftime("%d-%m-%Y %H:%M %Z")
 
-async def send_alert(symbol: str, reasons_by_tf: Dict[str, List[str]], final_opinion: str):
+async def send_alert(symbol: str, reasons_by_tf: Dict[str, List[str]], final_opinion: str, profiles: List[str]):
     timestamp = now_local_str()
     status_text = await format_status(symbol)
     pct24 = await get_ticker_24h(symbol)
@@ -646,8 +930,10 @@ async def send_alert(symbol: str, reasons_by_tf: Dict[str, List[str]], final_opi
         r = reasons_by_tf.get(tf, [])
         return f"{tf}: " + (" + ".join(r) if r else "No Signal")
 
+    prof_line = ("Profiles: " + ", ".join(profiles)) if profiles else "Profiles: —"
+
     message = (
-        "🚨 Bullish Signal Detected!\n"
+        "🚨 *Bullish Signal Detected!*\n"
         f"Coin: `{symbol}`\n"
         f"Status: {status_text}\n"
         f"Time: {timestamp}\n"
@@ -658,6 +944,7 @@ async def send_alert(symbol: str, reasons_by_tf: Dict[str, List[str]], final_opi
         f"{tf_line('4h')}\n"
         f"{tf_line('1d')}\n"
         "---------------------------------\n"
+        f"{prof_line}\n"
         f"{final_opinion}"
     )
 
@@ -679,14 +966,14 @@ def chunked(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
-async def scan_one_with_backoff(coin):
+async def scan_one_with_backoff(coin, btc_cache):
     max_attempts = 5
     delay = 1
     for attempt in range(max_attempts):
         try:
-            reasons_by_tf, final_opinion, _ = await detect_signals(coin)
+            reasons_by_tf, final_opinion, _, profiles = await detect_signals(coin, btc_1h_cache=btc_cache)
             if reasons_by_tf:
-                await send_alert(coin, reasons_by_tf, final_opinion or "⚪ No edge")
+                await send_alert(coin, reasons_by_tf, final_opinion or "⚪ No edge", profiles)
             await asyncio.sleep(SLEEP_TIME)
             break
         except RateLimitError as e:
@@ -723,13 +1010,18 @@ async def batch_scan_all_with_rate_limit():
     symbols = [c for c in symbols if not any(x in c for x in ["UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT"])]
     await auto_add_new_listings(symbols)
     logger.info("Total %s USDT spot symbols. Scanning in batches of %s ...", len(symbols), BINANCE_BATCH_SIZE)
+
+    # BTC 1h cache for RS profile
+    btc_cache: Dict[str,List[float]] = {}
+
     for batch in chunked(symbols, BINANCE_BATCH_SIZE):
         logger.info("Scanning batch of %s coins...", len(batch))
         async def limited_scan(coin):
             if binance_sem is None:
                 raise RuntimeError("Semaphore not initialized")
-            async with binance_sem:
-                await scan_one_with_backoff(coin)
+            sem = binance_sem
+            async with sem:
+                await scan_one_with_backoff(coin, btc_cache)
         tasks = [limited_scan(coin) for coin in batch]
         await asyncio.gather(*tasks)
         logger.info("Sleeping 60 seconds for next batch...")
@@ -744,7 +1036,7 @@ async def scanner_loop():
             logger.info("Sleeping 10 minutes...")
             await asyncio.sleep(600)
 
-# ===================== Aggregator (custom times) =====================
+# ===================== Aggregator (5 times/day) =====================
 LAST_REPORT_SENT: Dict[str, datetime] = {}
 
 AGG_TIMES_LOCAL = [
@@ -821,7 +1113,7 @@ async def aggregator_loop():
             logger.exception("Aggregator loop error")
             await asyncio.sleep(30)
 
-# ===================== NEW: Top Gainer Command Handler =====================
+# ===================== Top Gainer + Volatility List Handlers =====================
 async def top_gainer_handler(update: TGUpdate, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
         return
@@ -838,6 +1130,31 @@ async def top_gainer_handler(update: TGUpdate, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         await update.message.reply_text(f"❌ Failed to fetch: {e}")
+
+async def volatility_list_handler(update: TGUpdate, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.text:
+        return
+    username = get_username(update)
+    if not is_admin(username):
+        await update.message.reply_text("⛔ You are not authorized to use commands.")
+        return
+    text = update.message.text.strip()
+    m = re.search(r'volatility\s+coin\s+list\s*(\d+)?', text, flags=re.IGNORECASE)
+    top_n = 20
+    if m and m.group(1):
+        try:
+            top_n = max(5, min(100, int(m.group(1))))
+        except Exception:
+            top_n = 20
+    await update.message.reply_text(f"⏳ Computing top {top_n} high-volatility coins (1H)...")
+    try:
+        items = await volatility_coin_list(top_n)
+        lines = [f"🌪️ Top {top_n} High Volatility (1H):", ""]
+        for i, (sym, vol) in enumerate(items, 1):
+            lines.append(f"{i:>2}. `{sym}` — Vol={vol:.4f}")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed: {e}")
 
 # ===================== Telegram commands =====================
 def parse_command(text: str) -> Tuple[List[str], str]:
@@ -856,6 +1173,7 @@ def parse_command(text: str) -> Tuple[List[str], str]:
     }
     found_action = ""
     coins = []
+    # special commands handled elsewhere
     for t in tokens:
         tl = t.lower()
         if tl in actions_map:
@@ -874,6 +1192,7 @@ def get_username(update: TGUpdate) -> str:
 
 def is_admin(username: Optional[str]) -> bool:
     return bool(username) and username.lower() in ["redwanict",]
+
 async def start(update: TGUpdate, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
@@ -884,8 +1203,11 @@ async def start(update: TGUpdate, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
     await update.message.reply_text(
-        f"👋 Hello @{username}! Send coin commands like:\n"
-        "BTCUSDT Check\nETH Remove\nBNB Haram\nBTC Add\nBNB Halal\nOr send: top gainer list"
+        "👋 Hello! Commands:\n"
+        "- `BTCUSDT Check`, `ETH Remove`, `BNB Haram`, `BTC Add`, `BNB Halal`\n"
+        "- `Top Gainer List`\n"
+        "- `Volatility Coin List` or `Volatility Coin List 30`",
+        parse_mode=ParseMode.MARKDOWN
     )
 
 async def status(update: TGUpdate, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -921,9 +1243,15 @@ async def handle_commands(update: TGUpdate, context: ContextTypes.DEFAULT_TYPE) 
     if not update.message or not update.message.text:
         return
     text = update.message.text.strip()
-    if text.lower() == "top gainer list":
+
+    # Special commands
+    if re.search(r'^\s*top\s+gainer\s+list\s*$', text, flags=re.IGNORECASE):
         await top_gainer_handler(update, context)
         return
+    if re.search(r'^\s*volatility\s+coin\s+list(?:\s+\d+)?\s*$', text, flags=re.IGNORECASE):
+        await volatility_list_handler(update, context)
+        return
+
     username = get_username(update)
     if not is_admin(username):
         await update.message.reply_text("⛔ You are not authorized to use commands.")
@@ -933,7 +1261,10 @@ async def handle_commands(update: TGUpdate, context: ContextTypes.DEFAULT_TYPE) 
     valid_actions = {"Check", "Remove", "Haram", "Add again", "Halal"}
     if not coins or action not in valid_actions:
         await update.message.reply_text(
-            "❌ Invalid format. Use keywords like:\nCheck, Remove, Haram, Add Again, Halal\nExample: BTC ETH Check\nOr send: top gainer list"
+            "❌ Invalid format. Use:\n"
+            "Check, Remove, Haram, Add Again, Halal\n"
+            "Example: BTC ETH Check\n"
+            "Or send: Top Gainer List / Volatility Coin List",
         )
         return
     try:
@@ -988,12 +1319,13 @@ async def handle_commands(update: TGUpdate, context: ContextTypes.DEFAULT_TYPE) 
     reply = "\n\n".join(reply_parts) or "✅ No changes made."
     await update.message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
 
+# ===================== App bootstrap =====================
 async def post_init(application):
     global aiohttp_session, binance_sem
     aiohttp_session = aiohttp.ClientSession(
         connector=aiohttp.TCPConnector(limit=100, ssl=False),
         timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
-        headers={"User-Agent": "CryptoWatchlistBot/1.3 (+contact)"}
+        headers={"User-Agent": "CryptoWatchlistBot/2.0 (+contact)"}
     )
     binance_sem = asyncio.Semaphore(MAX_CONCURRENCY)
     application.create_task(scanner_loop())

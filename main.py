@@ -12,6 +12,7 @@ import numpy as np
 from dotenv import load_dotenv
 from flask import Flask
 from telegram import Update as TGUpdate, Bot as TGBot
+from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     ContextTypes, filters
@@ -180,10 +181,20 @@ async def binance_request(path: str, params: Optional[dict] = None) -> Tuple[Any
         data = await resp.json(content_type=None)
         return data, used_weight
 
-async def get_exchange_info():
+async def get_exchange_info(filtering_on=True):
     data, used = await binance_request("/api/v3/exchangeInfo")
     if used:
         logger.debug("ExchangeInfo weight: %s", used)
+    if not filtering_on:
+        return data
+    symbols = [
+        s for s in data.get("symbols", [])
+        if s.get("quoteAsset") == "USDT"
+        and s.get("status") == "TRADING"
+        and s.get("isSpotTradingAllowed", True)
+        and not any(x in s["symbol"] for x in ["UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT"])
+    ]
+    data["symbols"] = symbols
     return data
 
 async def get_klines(symbol: str, interval: str, limit: int = 150):
@@ -200,27 +211,25 @@ async def get_ticker_24h(symbol: str) -> Optional[float]:
         logger.exception("24h ticker error for %s", symbol)
         return None
 
-async def get_top_gainers(n=10) -> List[Tuple[str, float]]:
-    exinfo = await get_exchange_info()
+async def get_top_gainers(n=10, filtering_on=True) -> List[Tuple[str, float]]:
+    exinfo = await get_exchange_info(filtering_on=filtering_on)
     symbols = [
         s["symbol"] for s in exinfo.get("symbols", [])
         if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING"
         and s.get("isSpotTradingAllowed", True)
-        and not any(x in s["symbol"] for x in ["UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT"])
+        and (filtering_on is False or not any(x in s["symbol"] for x in ["UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT"]))
     ]
     global binance_sem
-    # ---------- FIX: Ensure binance_sem is always initialized before use ----------
     if binance_sem is None:
         binance_sem = asyncio.Semaphore(MAX_CONCURRENCY)
 
     async def get_pct(symbol):
         try:
-            # FIX: Ensure binance_sem is not None before using in async with
             if binance_sem is None:
                 raise RuntimeError("binance_sem not initialized")
             async with binance_sem:
                 pct = await get_ticker_24h(symbol)
-                await asyncio.sleep(0.3)  # rate limit
+                await asyncio.sleep(0.25)
             return (symbol, pct)
         except Exception:
             return (symbol, None)
@@ -658,7 +667,7 @@ async def send_alert(symbol: str, reasons_by_tf: Dict[str, List[str]], final_opi
             reasons_flat.append(f"{tf}: {r}")
     reasons_text = " | ".join(reasons_flat) if reasons_flat else "No Signal"
     try:
-        await bot.send_message(chat_id=CHAT_ID, text=message)
+        await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode=ParseMode.MARKDOWN)
         mark_alert(symbol)
         await log_to_supabase(symbol, reasons_text, final_opinion)
         logger.info("Telegram alert sent for %s", symbol)
@@ -800,7 +809,7 @@ async def aggregator_loop():
                         lines.append(f"   24h Change: {pct_str}")
                     message = "\n".join(lines)
                     try:
-                        await bot.send_message(chat_id=CHAT_ID, text=message)
+                        await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode=ParseMode.MARKDOWN)
                         logger.info("Aggregator message sent for window %s", window_end_local.isoformat())
                     except Exception:
                         logger.exception("Telegram send error in aggregator")
@@ -822,11 +831,11 @@ async def top_gainer_handler(update: TGUpdate, context: ContextTypes.DEFAULT_TYP
         return
     await update.message.reply_text("⏳ Fetching top gainers, please wait...")
     try:
-        gainers = await get_top_gainers(10)
-        lines = ["🔥 Top 10 Binance USDT Spot Gainers (24h):"]
+        gainers = await get_top_gainers(10, filtering_on=False)
+        lines = ["🔥 Top 10 Binance USDT Spot Gainers (24h) [Filter OFF]:\n"]
         for i, (coin, pct) in enumerate(gainers, 1):
             lines.append(f"{i}. `{coin}` : {pct:+.2f}%")
-        await update.message.reply_text("\n".join(lines))
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         await update.message.reply_text(f"❌ Failed to fetch: {e}")
 
@@ -864,8 +873,7 @@ def get_username(update: TGUpdate) -> str:
     return user.username or str(user.id) if user else "Unknown"
 
 def is_admin(username: Optional[str]) -> bool:
-    return username == "RedwanICT"  # change as needed
-
+    return bool(username) and username.lower() in ["redwanict",]
 async def start(update: TGUpdate, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
@@ -895,13 +903,19 @@ async def status(update: TGUpdate, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     parts = []
     parts.append(f"📊 Watchlist ({wl_total}):")
-    parts.extend([f"`{w}`" for w in watchlist] if watchlist else ["—"])
+    if watchlist:
+        parts.append(" ".join(f"`{w}`" for w in watchlist))
+    else:
+        parts.append("—")
     parts.append("")
     parts.append(f"⚠️ Haram ({hr_total}):")
-    parts.extend([f"`{h}`" for h in haram] if haram else ["—"])
+    if haram:
+        parts.append(" ".join(f"`{h}`" for h in haram))
+    else:
+        parts.append("—")
 
     reply = "\n".join(parts)
-    await update.message.reply_text(reply)
+    await update.message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
 
 async def handle_commands(update: TGUpdate, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
@@ -962,17 +976,17 @@ async def handle_commands(update: TGUpdate, context: ContextTypes.DEFAULT_TYPE) 
 
     reply_parts = []
     if already:
-        reply_parts.append("🟢 Already in Watchlist:\n" + "\n".join(f"`{x}`" for x in already))
+        reply_parts.append("🟢 Already in Watchlist:\n" + " ".join(f"`{x}`" for x in already))
     if added:
-        reply_parts.append("✅ New Added:\n" + "\n".join(f"`{x}`" for x in added))
+        reply_parts.append("✅ New Added:\n" + " ".join(f"`{x}`" for x in added))
     if marked_haram:
-        reply_parts.append("⚠️ Marked as Haram:\n" + "\n".join(f"`{x}`" for x in marked_haram))
+        reply_parts.append("⚠️ Marked as Haram:\n" + " ".join(f"`{x}`" for x in marked_haram))
     if removed:
-        reply_parts.append("🗑️ Removed:\n" + "\n".join(f"`{x}`" for x in removed))
+        reply_parts.append("🗑️ Removed:\n" + " ".join(f"`{x}`" for x in removed))
     if unharamed:
-        reply_parts.append("✅ Removed from Haram:\n" + "\n".join(f"`{x}`" for x in unharamed))
+        reply_parts.append("✅ Removed from Haram:\n" + " ".join(f"`{x}`" for x in unharamed))
     reply = "\n\n".join(reply_parts) or "✅ No changes made."
-    await update.message.reply_text(reply)
+    await update.message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
 
 async def post_init(application):
     global aiohttp_session, binance_sem
